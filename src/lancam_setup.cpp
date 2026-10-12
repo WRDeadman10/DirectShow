@@ -112,18 +112,45 @@ static void RegisterKeysInHive(HKEY rootKey, const std::wstring& exePath, const 
 }
 
 void RegisterProtocolAndFilter(const std::wstring& exePath, const std::wstring& dllPath) {
-    // Register system-wide
-    RegisterKeysInHive(HKEY_CLASSES_ROOT, exePath, dllPath);
+    // 1. Copy to Program Files so Windows UWP Camera / FrameServer service has access
+    std::wstring installedDllPath = dllPath;
+    std::wstring installedExePath = exePath;
 
-    // Register per-user
+    wchar_t progFiles[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_PROGRAM_FILES, NULL, 0, progFiles))) {
+        std::wstring destDir = std::wstring(progFiles) + L"\\LanCamera";
+        CreateDirectoryW(destDir.c_str(), NULL);
+
+        std::wstring destDll = destDir + L"\\LanCamFilter.dll";
+        if (CopyFileW(dllPath.c_str(), destDll.c_str(), FALSE)) {
+            installedDllPath = destDll;
+        }
+
+        std::wstring destExe = destDir + L"\\lancam-setup.exe";
+        if (CopyFileW(exePath.c_str(), destExe.c_str(), FALSE)) {
+            installedExePath = destExe;
+        }
+    }
+
+    // 2. Register directly in HKEY_LOCAL_MACHINE\SOFTWARE\Classes
+    HKEY hklmSoftware = NULL;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Classes", 0, KEY_WRITE, &hklmSoftware) == ERROR_SUCCESS) {
+        RegisterKeysInHive(hklmSoftware, installedExePath, installedDllPath);
+        RegCloseKey(hklmSoftware);
+    }
+
+    // 3. Register in HKEY_CLASSES_ROOT
+    RegisterKeysInHive(HKEY_CLASSES_ROOT, installedExePath, installedDllPath);
+
+    // 4. Register per-user in HKCU
     HKEY hkcuClasses = NULL;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Classes", 0, KEY_WRITE, &hkcuClasses) == ERROR_SUCCESS) {
-        RegisterKeysInHive(hkcuClasses, exePath, dllPath);
+        RegisterKeysInHive(hkcuClasses, installedExePath, installedDllPath);
         RegCloseKey(hkcuClasses);
     }
 
-    // Call regsvr32 as well
-    std::wstring regCmd = L"regsvr32.exe /s \"" + dllPath + L"\"";
+    // 5. Call regsvr32
+    std::wstring regCmd = L"regsvr32.exe /s \"" + installedDllPath + L"\"";
     _wsystem(regCmd.c_str());
 }
 
