@@ -458,6 +458,38 @@ DWORD WINAPI LanCamPin::StreamThreadProc(LPVOID lpParam) {
     return 0;
 }
 
+// Frames arrive top-down (JPEG/browser order) while an RGB24 DirectShow sample with a positive biHeight is
+// bottom-up, so rows are flipped. The frame is also scaled (nearest neighbour) and letterboxed to the pin's
+// negotiated size, so any phone resolution or orientation fills the sample correctly.
+static void BlitTopDownToBottomUp(const BYTE* src, int srcW, int srcH, size_t srcStride,
+                                  BYTE* dst, int dstW, int dstH, size_t dstStride) {
+    ZeroMemory(dst, dstStride * (size_t)dstH);
+    if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) {
+        return;
+    }
+
+    double scale = min((double)dstW / srcW, (double)dstH / srcH);
+    int outW = max(1, (int)(srcW * scale));
+    int outH = max(1, (int)(srcH * scale));
+    int offX = (dstW - outW) / 2;
+    int offY = (dstH - outH) / 2;
+
+    for (int y = 0; y < outH; ++y) {
+        int srcY = min(srcH - 1, (int)((long long)y * srcH / outH));
+        int dstRow = dstH - 1 - (offY + y);
+        BYTE* dstPixel = dst + (size_t)dstRow * dstStride + (size_t)offX * 3;
+        const BYTE* srcRow = src + (size_t)srcY * srcStride;
+        for (int x = 0; x < outW; ++x) {
+            int srcX = min(srcW - 1, (int)((long long)x * srcW / outW));
+            const BYTE* srcPixel = srcRow + (size_t)srcX * 3;
+            dstPixel[0] = srcPixel[0];
+            dstPixel[1] = srcPixel[1];
+            dstPixel[2] = srcPixel[2];
+            dstPixel += 3;
+        }
+    }
+}
+
 void LanCamPin::StreamLoop() {
     REFERENCE_TIME rtStart = 0;
     const REFERENCE_TIME rtFrameDuration = 10000000 / 30; // 30 FPS
@@ -465,6 +497,17 @@ void LanCamPin::StreamLoop() {
     std::vector<BYTE> rgbBuffer;
     int frameW = 1280;
     int frameH = 720;
+
+    int outW = 1280;
+    int outH = 720;
+    if (m_mt.pbFormat && m_mt.formattype == FORMAT_VideoInfo && m_mt.cbFormat >= sizeof(VIDEOINFOHEADER)) {
+        const VIDEOINFOHEADER* pvih = (const VIDEOINFOHEADER*)m_mt.pbFormat;
+        if (pvih->bmiHeader.biWidth > 0 && pvih->bmiHeader.biHeight != 0) {
+            outW = pvih->bmiHeader.biWidth;
+            outH = abs(pvih->bmiHeader.biHeight);
+        }
+    }
+    const size_t outStride = (size_t)((outW * 3 + 3) & ~3);
 
     while (m_bStreaming && WaitForSingleObject(m_hStopEvent, 33) == WAIT_TIMEOUT) {
         if (!m_pAllocator || !m_pMemInputPin) continue;
@@ -487,11 +530,11 @@ void LanCamPin::StreamLoop() {
                 hasFrame = m_pFilter->GetDecoder().GetLatestFrameRgb24(rgbBuffer, frameW, frameH);
             }
 
-            if (hasFrame && !rgbBuffer.empty()) {
-                // Copy frame into sample buffer
-                size_t copyBytes = min((size_t)cbBuffer, rgbBuffer.size());
-                CopyMemory(pBuffer, rgbBuffer.data(), copyBytes);
-                pSample->SetActualDataLength((long)copyBytes);
+            const size_t outBytes = outStride * (size_t)outH;
+            const size_t srcStride = (hasFrame && frameH > 0) ? rgbBuffer.size() / (size_t)frameH : 0;
+            if (hasFrame && frameW > 0 && frameH > 0 && srcStride >= (size_t)frameW * 3 && (size_t)cbBuffer >= outBytes) {
+                BlitTopDownToBottomUp(rgbBuffer.data(), frameW, frameH, srcStride, pBuffer, outW, outH, outStride);
+                pSample->SetActualDataLength((long)outBytes);
             } else {
                 // Blank dark test pattern while waiting for WebRTC stream
                 ZeroMemory(pBuffer, cbBuffer);

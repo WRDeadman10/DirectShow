@@ -1,0 +1,4 @@
+LIBRARY LanCamMfSource
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE

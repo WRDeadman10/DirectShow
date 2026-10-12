@@ -27,13 +27,26 @@ if %ERRORLEVEL% neq 0 (
     exit /b %ERRORLEVEL%
 )
 
+echo Compiling LanCamMfSource.dll (Media Foundation virtual camera source)...
+cl.exe /O2 /MD /EHsc /W3 /LD ^
+    /I"%INC_DIR%" ^
+    /Fo"%BUILD_DIR%\\" ^
+    "%SRC_DIR%\lancam_mfsource.cpp" ^
+    /Fe"%BUILD_DIR%\LanCamMfSource.dll" ^
+    /link /DEF:"%SRC_DIR%\lancam_mfsource.def" /SUBSYSTEM:WINDOWS
+
+if %ERRORLEVEL% neq 0 (
+    echo Error compiling LanCamMfSource.dll!
+    exit /b %ERRORLEVEL%
+)
+
 echo Compiling lancam-setup.exe...
 cl.exe /O2 /MD /EHsc /W3 ^
     /I"%INC_DIR%" ^
     /Fo"%BUILD_DIR%\\" ^
     "%SRC_DIR%\lancam_setup.cpp" ^
     /Fe"%BUILD_DIR%\lancam-setup.exe" ^
-    /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTUAC:"level='requireAdministrator' uiAccess='false'" user32.lib shell32.lib advapi32.lib ole32.lib ws2_32.lib
+    /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTUAC:"level='asInvoker' uiAccess='false'" user32.lib shell32.lib advapi32.lib ole32.lib ws2_32.lib mfplat.lib mf.lib mfuuid.lib mfsensorgroup.lib
 
 if %ERRORLEVEL% neq 0 (
     echo Error compiling lancam-setup.exe!
@@ -43,5 +56,6 @@ if %ERRORLEVEL% neq 0 (
 echo.
 echo Build successful! Outputs:
 echo   - %BUILD_DIR%\LanCamFilter.dll
+echo   - %BUILD_DIR%\LanCamMfSource.dll
 echo   - %BUILD_DIR%\lancam-setup.exe
 echo.
