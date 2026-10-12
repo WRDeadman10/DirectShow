@@ -478,14 +478,22 @@ void LanCamPin::StreamLoop() {
         long cbBuffer = pSample->GetSize();
 
         if (pBuffer && cbBuffer > 0) {
-            bool hasFrame = m_pFilter->GetDecoder().GetLatestFrameRgb24(rgbBuffer, frameW, frameH);
+            static ULONGLONG lastShmFrameIdx = 0;
+            // 1. Prioritize WebRTC Shared Memory Bridge (pure P2P WebRTC from browser)
+            bool hasFrame = m_pFilter->GetShmReader().ReadLatestFrame(rgbBuffer, frameW, frameH, lastShmFrameIdx);
+
+            // 2. Fallback to MJPEG if shared memory is inactive
+            if (!hasFrame && rgbBuffer.empty()) {
+                hasFrame = m_pFilter->GetDecoder().GetLatestFrameRgb24(rgbBuffer, frameW, frameH);
+            }
+
             if (hasFrame && !rgbBuffer.empty()) {
                 // Copy frame into sample buffer
                 size_t copyBytes = min((size_t)cbBuffer, rgbBuffer.size());
                 CopyMemory(pBuffer, rgbBuffer.data(), copyBytes);
                 pSample->SetActualDataLength((long)copyBytes);
             } else {
-                // Blank dark test pattern while connecting
+                // Blank dark test pattern while waiting for WebRTC stream
                 ZeroMemory(pBuffer, cbBuffer);
                 pSample->SetActualDataLength(cbBuffer);
             }

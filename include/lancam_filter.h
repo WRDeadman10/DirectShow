@@ -7,6 +7,7 @@
 #include <memory>
 #include "filter_guids.h"
 #include "mjpeg_decoder.h"
+#include "shm_bridge.h"
 #include "config_manager.h"
 
 class LanCamFilter;
@@ -102,6 +103,7 @@ public:
     STDMETHODIMP JoinFilterGraph(IFilterGraph* pGraph, LPCWSTR pName) override;
     STDMETHODIMP QueryVendorInfo(LPWSTR* pVendorInfo) override;
 
+    LanCamShmReader& GetShmReader() { return m_shmReader; }
     MjpegDecoder& GetDecoder() { return m_decoder; }
     FILTER_STATE GetFilterState() const { return m_state; }
 
@@ -111,5 +113,6 @@ private:
     IReferenceClock* m_pClock;
     IFilterGraph* m_pGraph;
     LanCamPin* m_pPin;
+    LanCamShmReader m_shmReader;
     MjpegDecoder m_decoder;
 };

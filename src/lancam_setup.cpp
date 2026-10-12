@@ -1,9 +1,14 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <string>
 #include <iostream>
+#include <thread>
+#include <vector>
 #include "../include/config_manager.h"
+#include "../include/shm_bridge.h"
 
-// Parse lancam://stream?room=123&pin=456&host=127.0.0.1&port=7777
+#pragma comment(lib, "ws2_32.lib")
 bool ParseUriAndSaveSession(const std::wstring& uri) {
     size_t queryPos = uri.find(L'?');
     if (queryPos == std::wstring::npos) {
@@ -59,6 +64,81 @@ void RegisterProtocolAndFilter(const std::wstring& exePath, const std::wstring& 
     _wsystem(regCmd.c_str());
 }
 
+// Background thread listening on 127.0.0.1:7779 for raw WebRTC frames from browser
+static void RunShmBridgeServer() {
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return;
+
+    SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSock == INVALID_SOCKET) {
+        WSACleanup();
+        return;
+    }
+
+    int opt = 1;
+    setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+
+    sockaddr_in addr;
+    ZeroMemory(&addr, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr.sin_port = htons(7779);
+
+    if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) != 0 || listen(listenSock, 1) != 0) {
+        closesocket(listenSock);
+        WSACleanup();
+        return;
+    }
+
+    LanCamShmWriter shmWriter;
+    shmWriter.Create();
+
+    while (true) {
+        SOCKET clientSock = accept(listenSock, NULL, NULL);
+        if (clientSock == INVALID_SOCKET) break;
+
+        // Header: uint32 width, uint32 height, uint32 dataSize
+        uint32_t header[3];
+        std::vector<BYTE> frameBuffer;
+
+        while (true) {
+            int recvd = 0;
+            while (recvd < (int)sizeof(header)) {
+                int n = recv(clientSock, (char*)header + recvd, (int)sizeof(header) - recvd, 0);
+                if (n <= 0) goto client_disconnected;
+                recvd += n;
+            }
+
+            uint32_t width = header[0];
+            uint32_t height = header[1];
+            uint32_t dataSize = header[2];
+
+            if (dataSize == 0 || dataSize > (1920 * 1080 * 3)) {
+                goto client_disconnected;
+            }
+
+            if (frameBuffer.size() < dataSize) {
+                frameBuffer.resize(dataSize);
+            }
+
+            uint32_t bytesGot = 0;
+            while (bytesGot < dataSize) {
+                int n = recv(clientSock, (char*)frameBuffer.data() + bytesGot, dataSize - bytesGot, 0);
+                if (n <= 0) goto client_disconnected;
+                bytesGot += n;
+            }
+
+            shmWriter.WriteFrame(width, height, frameBuffer.data(), dataSize);
+        }
+
+client_disconnected:
+        closesocket(clientSock);
+    }
+
+    closesocket(listenSock);
+    WSACleanup();
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     wchar_t szExePath[MAX_PATH];
     GetModuleFileNameW(NULL, szExePath, MAX_PATH);
@@ -72,13 +152,30 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     std::wstring cmdLine = pCmdLine ? pCmdLine : L"";
 
+    // If launched with --bridge, run the shared memory bridge in background
+    if (cmdLine.find(L"--bridge") != std::wstring::npos) {
+        RunShmBridgeServer();
+        return 0;
+    }
+
     if (cmdLine.find(L"lancam://") != std::wstring::npos) {
         // Deeplink triggered!
         ParseUriAndSaveSession(cmdLine);
 
+        // Ensure bridge process is running
+        std::wstring bridgeCmd = L"\"" + std::wstring(szExePath) + L"\" --bridge";
+        STARTUPINFOW si;
+        PROCESS_INFORMATION pi;
+        ZeroMemory(&si, sizeof(si));
+        si.cb = sizeof(si);
+        ZeroMemory(&pi, sizeof(pi));
+        CreateProcessW(NULL, (LPWSTR)bridgeCmd.c_str(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+        if (pi.hProcess) CloseHandle(pi.hProcess);
+        if (pi.hThread) CloseHandle(pi.hThread);
+
         // Notify user
         LanCamSession s = LoadLanCamSession();
-        std::wstring msg = L"LAN Phone Camera linked to Room: " + s.roomId + L"\nOpen Windows Camera or any app to view!";
+        std::wstring msg = L"LAN Phone Camera linked via pure WebRTC!\nRoom: " + s.roomId + L"\nOpen Windows Camera or any app to view!";
         MessageBoxW(NULL, msg.c_str(), L"LAN Camera Linked", MB_OK | MB_ICONINFORMATION);
         return 0;
     }
@@ -88,7 +185,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     MessageBoxW(
         NULL,
         L"LAN Phone Camera Driver installed and registered successfully!\n\n"
-        L"You can now click 'Set as Webcam' in the web viewer to tune the camera to any room.",
+        L"You can now click 'Set as Webcam' in the web viewer to tune the camera to any room via WebRTC.",
         L"LAN Camera Driver Setup",
         MB_OK | MB_ICONINFORMATION
     );
