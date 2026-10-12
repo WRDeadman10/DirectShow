@@ -29,6 +29,10 @@ bool ParseUriAndSaveSession(const std::wstring& uri) {
             std::wstring key = pair.substr(0, eqPos);
             std::wstring val = pair.substr(eqPos + 1);
 
+            while (!val.empty() && (val.back() == L'"' || val.back() == L'\'' || val.back() == L'/' || val.back() == L'\\' || val.back() == L' ')) {
+                val.pop_back();
+            }
+
             if (_wcsicmp(key.c_str(), L"room") == 0) {
                 session.roomId = val;
             } else if (_wcsicmp(key.c_str(), L"pin") == 0) {
@@ -162,21 +166,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         // Deeplink triggered!
         ParseUriAndSaveSession(cmdLine);
 
-        // Ensure bridge process is running
-        std::wstring bridgeCmd = L"\"" + std::wstring(szExePath) + L"\" --bridge";
-        STARTUPINFOW si;
-        PROCESS_INFORMATION pi;
-        ZeroMemory(&si, sizeof(si));
-        si.cb = sizeof(si);
-        ZeroMemory(&pi, sizeof(pi));
-        CreateProcessW(NULL, (LPWSTR)bridgeCmd.c_str(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
-        if (pi.hProcess) CloseHandle(pi.hProcess);
-        if (pi.hThread) CloseHandle(pi.hThread);
-
-        // Notify user
-        LanCamSession s = LoadLanCamSession();
-        std::wstring msg = L"LAN Phone Camera linked via pure WebRTC!\nRoom: " + s.roomId + L"\nOpen Windows Camera or any app to view!";
-        MessageBoxW(NULL, msg.c_str(), L"LAN Camera Linked", MB_OK | MB_ICONINFORMATION);
+        // Automatically open the native Windows Camera app
+        ShellExecuteW(NULL, L"open", L"microsoft.windows.camera:", NULL, NULL, SW_SHOWNORMAL);
         return 0;
     }
 

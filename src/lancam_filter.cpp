@@ -482,8 +482,8 @@ void LanCamPin::StreamLoop() {
             // 1. Prioritize WebRTC Shared Memory Bridge (pure P2P WebRTC from browser)
             bool hasFrame = m_pFilter->GetShmReader().ReadLatestFrame(rgbBuffer, frameW, frameH, lastShmFrameIdx);
 
-            // 2. Fallback to MJPEG if shared memory is inactive
-            if (!hasFrame && rgbBuffer.empty()) {
+            // 2. Decode from local WebRTC bridge stream if shared memory is inactive
+            if (!hasFrame) {
                 hasFrame = m_pFilter->GetDecoder().GetLatestFrameRgb24(rgbBuffer, frameW, frameH);
             }
 
