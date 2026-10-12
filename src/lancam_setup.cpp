@@ -49,21 +49,80 @@ bool ParseUriAndSaveSession(const std::wstring& uri) {
     return SaveLanCamSession(session);
 }
 
-void RegisterProtocolAndFilter(const std::wstring& exePath, const std::wstring& dllPath) {
-    // 1. Register lancam:// protocol handler
+static const BYTE kFilterData[] = {
+    0x02, 0x00, 0x00, 0x00, // dwVersion = 2
+    0x00, 0x00, 0x20, 0x00, // dwMerit = 0x00200000
+    0x01, 0x00, 0x00, 0x00, // cPins = 1
+    0x00, 0x00, 0x00, 0x00, // cInstance = 0
+    0x30, 0x70, 0x69, 0x33, // '3ip0' pin identifier
+    0x08, 0x00, 0x00, 0x00, // dwFlags = REG_PINFLAG_B_OUTPUT (8)
+    0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, // nMediaTypes = 1
+    0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+    0x30, 0x74, 0x79, 0x33, // '3yt0' mediatype identifier
+    0x00, 0x00, 0x00, 0x00,
+    0x38, 0x00, 0x00, 0x00, // offset to major type (56)
+    0x48, 0x00, 0x00, 0x00, // offset to sub type (72)
+    // MEDIATYPE_Video: {73646976-0000-0010-8000-00AA00389B71}
+    0x76, 0x69, 0x64, 0x73, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+    // MEDIASUBTYPE_None: {00000000-0000-0000-0000-000000000000}
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+static void RegisterKeysInHive(HKEY rootKey, const std::wstring& exePath, const std::wstring& dllPath) {
     HKEY hKey = NULL;
-    RegCreateKeyExW(HKEY_CLASSES_ROOT, L"lancam", 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL);
-    RegSetValueExW(hKey, NULL, 0, REG_SZ, (const BYTE*)L"URL:LAN Camera Protocol", sizeof(L"URL:LAN Camera Protocol"));
-    RegSetValueExW(hKey, L"URL Protocol", 0, REG_SZ, (const BYTE*)L"", sizeof(L""));
-    RegCloseKey(hKey);
+
+    // 1. Register lancam:// protocol handler
+    if (RegCreateKeyExW(rootKey, L"lancam", 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(hKey, NULL, 0, REG_SZ, (const BYTE*)L"URL:LAN Camera Protocol", sizeof(L"URL:LAN Camera Protocol"));
+        RegSetValueExW(hKey, L"URL Protocol", 0, REG_SZ, (const BYTE*)L"", sizeof(L""));
+        RegCloseKey(hKey);
+    }
 
     std::wstring cmdKeyPath = L"lancam\\shell\\open\\command";
-    RegCreateKeyExW(HKEY_CLASSES_ROOT, cmdKeyPath.c_str(), 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL);
-    std::wstring cmdVal = L"\"" + exePath + L"\" \"%1\"";
-    RegSetValueExW(hKey, NULL, 0, REG_SZ, (const BYTE*)cmdVal.c_str(), (DWORD)(cmdVal.length() + 1) * sizeof(wchar_t));
-    RegCloseKey(hKey);
+    if (RegCreateKeyExW(rootKey, cmdKeyPath.c_str(), 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        std::wstring cmdVal = L"\"" + exePath + L"\" \"%1\"";
+        RegSetValueExW(hKey, NULL, 0, REG_SZ, (const BYTE*)cmdVal.c_str(), (DWORD)(cmdVal.length() + 1) * sizeof(wchar_t));
+        RegCloseKey(hKey);
+    }
 
-    // 2. Register DirectShow Filter via regsvr32
+    // 2. Register CLSID InprocServer32
+    std::wstring clsidPath = L"CLSID\\{708B7B2B-191B-4E3F-8C7E-F037A32F5112}";
+    if (RegCreateKeyExW(rootKey, clsidPath.c_str(), 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(hKey, NULL, 0, REG_SZ, (const BYTE*)L"LAN Phone Camera", sizeof(L"LAN Phone Camera"));
+        RegCloseKey(hKey);
+    }
+
+    std::wstring inprocPath = clsidPath + L"\\InprocServer32";
+    if (RegCreateKeyExW(rootKey, inprocPath.c_str(), 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(hKey, NULL, 0, REG_SZ, (const BYTE*)dllPath.c_str(), (DWORD)(dllPath.length() + 1) * sizeof(wchar_t));
+        RegSetValueExW(hKey, L"ThreadingModel", 0, REG_SZ, (const BYTE*)L"Both", sizeof(L"Both"));
+        RegCloseKey(hKey);
+    }
+
+    // 3. Register under DirectShow Video Input Category with FilterData
+    std::wstring catPath = L"CLSID\\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\\Instance\\{708B7B2B-191B-4E3F-8C7E-F037A32F5112}";
+    if (RegCreateKeyExW(rootKey, catPath.c_str(), 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(hKey, L"FriendlyName", 0, REG_SZ, (const BYTE*)L"LAN Phone Camera", sizeof(L"LAN Phone Camera"));
+        RegSetValueExW(hKey, L"CLSID", 0, REG_SZ, (const BYTE*)L"{708B7B2B-191B-4E3F-8C7E-F037A32F5112}", sizeof(L"{708B7B2B-191B-4E3F-8C7E-F037A32F5112}"));
+        RegSetValueExW(hKey, L"FilterData", 0, REG_BINARY, kFilterData, sizeof(kFilterData));
+        RegCloseKey(hKey);
+    }
+}
+
+void RegisterProtocolAndFilter(const std::wstring& exePath, const std::wstring& dllPath) {
+    // Register system-wide
+    RegisterKeysInHive(HKEY_CLASSES_ROOT, exePath, dllPath);
+
+    // Register per-user
+    HKEY hkcuClasses = NULL;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Classes", 0, KEY_WRITE, &hkcuClasses) == ERROR_SUCCESS) {
+        RegisterKeysInHive(hkcuClasses, exePath, dllPath);
+        RegCloseKey(hkcuClasses);
+    }
+
+    // Call regsvr32 as well
     std::wstring regCmd = L"regsvr32.exe /s \"" + dllPath + L"\"";
     _wsystem(regCmd.c_str());
 }
@@ -172,6 +231,32 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
 
     // Default execution: Install & Register Filter
+    // Check elevation to ensure system-wide registration for Windows Camera app
+    if (cmdLine.empty()) {
+        BOOL isElevated = FALSE;
+        HANDLE hToken = NULL;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+            TOKEN_ELEVATION el;
+            DWORD cb = sizeof(el);
+            if (GetTokenInformation(hToken, TokenElevation, &el, sizeof(el), &cb)) {
+                isElevated = (el.TokenIsElevated != 0);
+            }
+            CloseHandle(hToken);
+        }
+
+        if (!isElevated) {
+            SHELLEXECUTEINFOW sei;
+            ZeroMemory(&sei, sizeof(sei));
+            sei.cbSize = sizeof(sei);
+            sei.lpVerb = L"runas";
+            sei.lpFile = szExePath;
+            sei.nShow = SW_SHOWNORMAL;
+            if (ShellExecuteExW(&sei)) {
+                return 0; // Elevated installer launched
+            }
+        }
+    }
+
     RegisterProtocolAndFilter(szExePath, dllPath);
     MessageBoxW(
         NULL,
