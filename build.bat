@@ -46,7 +46,7 @@ cl.exe /O2 /MD /EHsc /W3 ^
     /Fo"%BUILD_DIR%\\" ^
     "%SRC_DIR%\lancam_setup.cpp" ^
     /Fe"%BUILD_DIR%\lancam-setup.exe" ^
-    /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTUAC:"level='asInvoker' uiAccess='false'" user32.lib shell32.lib advapi32.lib ole32.lib ws2_32.lib mfplat.lib mf.lib mfuuid.lib mfsensorgroup.lib
+    /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTUAC:"level='asInvoker' uiAccess='false'" user32.lib shell32.lib advapi32.lib ole32.lib ws2_32.lib mfplat.lib mf.lib mfuuid.lib
 
 if %ERRORLEVEL% neq 0 (
     echo Error compiling lancam-setup.exe!

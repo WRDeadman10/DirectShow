@@ -215,8 +215,40 @@ static void UnregisterMfSourceClass() {
     SetupLog(L"MF: RegDeleteTree -> %ld", (long)status);
 }
 
+typedef HRESULT (STDAPICALLTYPE *PFN_MFCreateVirtualCamera)(
+    MFVirtualCameraType type,
+    MFVirtualCameraLifetime lifetime,
+    MFVirtualCameraAccess access,
+    LPCWSTR pwzFriendlyName,
+    LPCWSTR pwzCLSID,
+    const GUID* pCategories,
+    ULONG cCategoryCount,
+    IMFVirtualCamera** ppVirtualCamera
+);
+
+static PFN_MFCreateVirtualCamera GetMFCreateVirtualCamera() {
+    static PFN_MFCreateVirtualCamera s_pfn = NULL;
+    static bool s_probed = false;
+    if (!s_probed) {
+        s_probed = true;
+        HMODULE hMfplat = GetModuleHandleW(L"mfplat.dll");
+        if (!hMfplat) {
+            hMfplat = LoadLibraryW(L"mfplat.dll");
+        }
+        if (hMfplat) {
+            s_pfn = (PFN_MFCreateVirtualCamera)GetProcAddress(hMfplat, "MFCreateVirtualCamera");
+        }
+    }
+    return s_pfn;
+}
+
 static HRESULT CreateMfCamera(IMFVirtualCamera** ppCamera) {
-    return MFCreateVirtualCamera(
+    PFN_MFCreateVirtualCamera pfn = GetMFCreateVirtualCamera();
+    if (!pfn) {
+        SetupLog(L"MF: MFCreateVirtualCamera not available on this Windows version (Windows 11 build 22000+ required)");
+        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    }
+    return pfn(
         MFVirtualCameraType_SoftwareCameraSource,
         MFVirtualCameraLifetime_System,
         MFVirtualCameraAccess_AllUsers,
@@ -229,6 +261,12 @@ static HRESULT CreateMfCamera(IMFVirtualCamera** ppCamera) {
 
 // Returns S_OK when the camera was created and started. Needs an elevated process.
 static HRESULT InstallMfVirtualCamera(const std::wstring& dllPath) {
+    PFN_MFCreateVirtualCamera pfn = GetMFCreateVirtualCamera();
+    if (!pfn) {
+        SetupLog(L"MF: MFCreateVirtualCamera not supported on this Windows version; skipping Media Foundation virtual camera registration (DirectShow virtual camera will be used).");
+        return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    }
+
     PrepareMachineDirectory();
     RegisterMfSourceClass(dllPath);
 
@@ -259,6 +297,12 @@ static HRESULT InstallMfVirtualCamera(const std::wstring& dllPath) {
 }
 
 static HRESULT RemoveMfVirtualCamera() {
+    PFN_MFCreateVirtualCamera pfn = GetMFCreateVirtualCamera();
+    if (!pfn) {
+        UnregisterMfSourceClass();
+        return S_OK;
+    }
+
     HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
     if (FAILED(hr)) return hr;
 
@@ -514,6 +558,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     if (SUCCEEDED(g_mfInstallResult)) {
         summary += L"- Media Foundation camera (Windows Camera app, Teams, Unity): registered\n\n";
         summary += L"Reopen any camera app. Click 'Set as Webcam' in the web viewer to choose the room.";
+    } else if (g_mfInstallResult == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) {
+        summary += L"- Media Foundation camera: Not supported on this Windows version (Windows 11 required)\n\n";
+        summary += L"The DirectShow camera is fully registered and ready to use in OBS, Zoom, Teams, Chrome, Unity, etc.";
     } else {
         wchar_t detail[200];
         swprintf_s(detail, L"- Media Foundation camera: FAILED (0x%08lx)\n  Details: %%ProgramData%%\\LanCamera\\setup.log\n\n",
