@@ -231,16 +231,52 @@ static PFN_MFCreateVirtualCamera GetMFCreateVirtualCamera() {
     static bool s_probed = false;
     if (!s_probed) {
         s_probed = true;
-        HMODULE hMfplat = GetModuleHandleW(L"mfplat.dll");
-        if (!hMfplat) {
-            hMfplat = LoadLibraryW(L"mfplat.dll");
+        // MFCreateVirtualCamera (Windows 11) is exported by mfsensorgroup.dll, NOT by mfplat.dll. Looking it up in
+        // mfplat.dll always fails and made the installer skip the Media Foundation camera on every machine.
+        const wchar_t* modules[] = { L"mfsensorgroup.dll", L"mfplat.dll" };
+        for (const wchar_t* moduleName : modules) {
+            HMODULE hModule = LoadLibraryW(moduleName);
+            if (hModule) {
+                s_pfn = (PFN_MFCreateVirtualCamera)GetProcAddress(hModule, "MFCreateVirtualCamera");
+                if (s_pfn) {
+                    SetupLog(L"MF: MFCreateVirtualCamera found in %s", moduleName);
+                    break;
+                }
+            }
         }
-        if (hMfplat) {
-            s_pfn = (PFN_MFCreateVirtualCamera)GetProcAddress(hMfplat, "MFCreateVirtualCamera");
+        if (!s_pfn) {
+            SetupLog(L"MF: MFCreateVirtualCamera not found (Windows 11 build 22000 or newer is required)");
         }
     }
     return s_pfn;
 }
+
+// True when the Windows camera stack (what the Camera app uses) lists the virtual camera.
+static bool IsMfCameraListed() {
+    IMFAttributes* attrs = NULL;
+    if (FAILED(MFCreateAttributes(&attrs, 1))) return false;
+    attrs->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+
+    bool found = false;
+    IMFActivate** devices = NULL;
+    UINT32 count = 0;
+    if (SUCCEEDED(MFEnumDeviceSources(attrs, &devices, &count))) {
+        for (UINT32 i = 0; i < count; ++i) {
+            WCHAR* name = NULL;
+            UINT32 length = 0;
+            if (SUCCEEDED(devices[i]->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &name, &length)) && name) {
+                if (wcsstr(name, kMfCameraName) != NULL) found = true;
+                CoTaskMemFree(name);
+            }
+            devices[i]->Release();
+        }
+        CoTaskMemFree(devices);
+    }
+    attrs->Release();
+    return found;
+}
+
+static bool g_mfListed = false;
 
 static HRESULT CreateMfCamera(IMFVirtualCamera** ppCamera) {
     PFN_MFCreateVirtualCamera pfn = GetMFCreateVirtualCamera();
@@ -267,6 +303,7 @@ static HRESULT InstallMfVirtualCamera(const std::wstring& dllPath) {
         return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     }
 
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
     PrepareMachineDirectory();
     RegisterMfSourceClass(dllPath);
 
@@ -290,6 +327,15 @@ static HRESULT InstallMfVirtualCamera(const std::wstring& dllPath) {
         hr = pCamera->Start(NULL);
         SetupLog(L"MF: IMFVirtualCamera::Start -> 0x%08lx", (unsigned long)hr);
         pCamera->Release();
+
+        if (SUCCEEDED(hr)) {
+            // Confirm Windows really lists the camera (it can take a moment after Start).
+            for (int attempt = 0; attempt < 12 && !g_mfListed; ++attempt) {
+                g_mfListed = IsMfCameraListed();
+                if (!g_mfListed) Sleep(500);
+            }
+            SetupLog(L"MF: camera listed by Windows: %d", g_mfListed ? 1 : 0);
+        }
     }
 
     MFShutdown();
@@ -322,6 +368,9 @@ static HRESULT RemoveMfVirtualCamera() {
 // DLLs mapped, which blocks overwriting them; Windows does allow renaming a mapped DLL, so the old file is moved
 // aside (and removed at the next reboot) and the new one is copied into place.
 static bool CopyFileWithRetry(const std::wstring& from, const std::wstring& to) {
+    if (_wcsicmp(from.c_str(), to.c_str()) == 0) {
+        return true;
+    }
     for (int attempt = 0; attempt < 3; ++attempt) {
         if (CopyFileW(from.c_str(), to.c_str(), FALSE)) {
             return true;
@@ -344,7 +393,48 @@ static bool CopyFileWithRetry(const std::wstring& from, const std::wstring& to) 
     return false;
 }
 
+// Removes everything RegisterProtocolAndFilter and InstallMfVirtualCamera created. Files are deleted by the
+// Inno Setup uninstaller afterwards. Needs an elevated process.
+static int UninstallCamera() {
+    SetupLog(L"uninstall: begin");
+
+    // Media Foundation camera + its COM class
+    HRESULT mfHr = RemoveMfVirtualCamera();
+    SetupLog(L"uninstall: MF removal -> 0x%08lx", (unsigned long)mfHr);
+
+    // DirectShow filter: unregister through its own entry point, then delete the registry entries the installer wrote
+    std::wstring dllPath;
+    wchar_t progFiles[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_PROGRAM_FILES, NULL, 0, progFiles))) {
+        dllPath = std::wstring(progFiles) + L"\\LanCamera\\LanCamFilter.dll";
+    }
+    if (!dllPath.empty() && GetFileAttributesW(dllPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        std::wstring unregCmd = L"regsvr32.exe /u /s \"" + dllPath + L"\"";
+        int rc = _wsystem(unregCmd.c_str());
+        SetupLog(L"uninstall: regsvr32 /u exit code %d", rc);
+    }
+
+    const wchar_t* keys[] = {
+        L"CLSID\\{708B7B2B-191B-4E3F-8C7E-F037A32F5112}",
+        L"CLSID\\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\\Instance\\{708B7B2B-191B-4E3F-8C7E-F037A32F5112}",
+        L"lancam"
+    };
+    HKEY hkcuClasses = NULL;
+    bool haveHkcu = RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Classes", 0, KEY_WRITE, &hkcuClasses) == ERROR_SUCCESS;
+    for (const wchar_t* key : keys) {
+        RegDeleteTreeW(HKEY_CLASSES_ROOT, key);
+        if (haveHkcu) RegDeleteTreeW(hkcuClasses, key);
+    }
+    if (haveHkcu) RegCloseKey(hkcuClasses);
+
+    // Let the Frame Server release the DLLs so the uninstaller can delete them
+    _wsystem(L"net stop FrameServer >nul 2>&1");
+    SetupLog(L"uninstall: done");
+    return 0;
+}
+
 static HRESULT g_mfInstallResult = E_FAIL;
+static int g_dsRegisterResult = -1;
 static bool g_mfDllFound = false;
 
 void RegisterProtocolAndFilter(const std::wstring& exePath, const std::wstring& dllPath) {
@@ -391,7 +481,8 @@ void RegisterProtocolAndFilter(const std::wstring& exePath, const std::wstring& 
 
     // 5. Call regsvr32
     std::wstring regCmd = L"regsvr32.exe /s \"" + installedDllPath + L"\"";
-    _wsystem(regCmd.c_str());
+    g_dsRegisterResult = _wsystem(regCmd.c_str());
+    SetupLog(L"DirectShow: regsvr32 exit code %d", g_dsRegisterResult);
 
     // 6. Media Foundation virtual camera (Windows Camera app, Teams, Chrome, Unity ...)
     std::wstring sourceDir = dllPath.substr(0, dllPath.find_last_of(L"\\/"));
@@ -511,10 +602,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     std::wstring cmdLine = pCmdLine ? pCmdLine : L"";
 
+    // --uninstall: remove every registration (used by the Inno Setup uninstaller; needs elevation)
+    if (cmdLine.find(L"--uninstall") != std::wstring::npos) {
+        if (!IsProcessElevated()) {
+            if (!RelaunchElevated(szExePath, cmdLine.c_str())) {
+                MessageBoxW(NULL, L"Administrator permission is required to remove the camera.", L"LAN Camera Driver Setup", MB_OK | MB_ICONWARNING);
+            }
+            return 0;
+        }
+        return UninstallCamera();
+    }
+
     // --remove-mf: delete the Media Foundation virtual camera and its COM registration (needs elevation)
     if (cmdLine.find(L"--remove-mf") != std::wstring::npos) {
         if (!IsProcessElevated()) {
-            if (!RelaunchElevated(szExePath, L"--remove-mf")) {
+            if (!RelaunchElevated(szExePath, cmdLine.c_str())) {
                 MessageBoxW(NULL, L"Administrator permission is required to remove the camera.", L"LAN Camera Driver Setup", MB_OK | MB_ICONWARNING);
             }
             return 0;
@@ -522,7 +624,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         HRESULT removeHr = RemoveMfVirtualCamera();
         wchar_t text[200];
         swprintf_s(text, L"LAN Phone Camera (Media Foundation) removal finished: 0x%08lx", (unsigned long)removeHr);
-        MessageBoxW(NULL, text, L"LAN Camera Driver Setup", MB_OK | MB_ICONINFORMATION);
+        if (cmdLine.find(L"--silent") == std::wstring::npos) {
+            MessageBoxW(NULL, text, L"LAN Camera Driver Setup", MB_OK | MB_ICONINFORMATION);
+        }
         return 0;
     }
 
@@ -551,27 +655,64 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         return 0;
     }
 
+    // Fail early and clearly when the driver files are missing (typical when lancam-setup.exe is run from inside the
+    // zip without extracting it).
+    const std::wstring mfDllPath = exeDir + L"\\LanCamMfSource.dll";
+    const bool haveFilterDll = GetFileAttributesW(dllPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool haveMfDll = GetFileAttributesW(mfDllPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (!haveFilterDll || !haveMfDll) {
+        SetupLog(L"preflight: missing files next to installer (LanCamFilter.dll=%d, LanCamMfSource.dll=%d) in %s",
+                 haveFilterDll ? 1 : 0, haveMfDll ? 1 : 0, exeDir.c_str());
+        if (!silent) {
+            MessageBoxW(NULL,
+                L"The driver files were not found next to lancam-setup.exe.\n\n"
+                L"Extract the whole zip into a folder first (right-click the zip > Extract All), then run "
+                L"lancam-setup.exe from that folder.",
+                L"LAN Camera Driver Setup", MB_OK | MB_ICONERROR);
+        }
+        return 2;
+    }
+
     RegisterProtocolAndFilter(szExePath, dllPath);
 
-    std::wstring summary = L"LAN Phone Camera driver installed.\n\n";
-    summary += L"- DirectShow camera (OBS, Zoom, Chrome, ffmpeg): registered\n";
-    if (SUCCEEDED(g_mfInstallResult)) {
-        summary += L"- Media Foundation camera (Windows Camera app, Teams, Unity): registered\n\n";
-        summary += L"Reopen any camera app. Click 'Set as Webcam' in the web viewer to choose the room.";
-    } else if (g_mfInstallResult == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) {
-        summary += L"- Media Foundation camera: Not supported on this Windows version (Windows 11 required)\n\n";
-        summary += L"The DirectShow camera is fully registered and ready to use in OBS, Zoom, Teams, Chrome, Unity, etc.";
+    std::wstring summary;
+    const bool mfOk = SUCCEEDED(g_mfInstallResult);
+    const bool dsOk = (g_dsRegisterResult == 0);
+
+    if (dsOk) {
+        summary += L"- DirectShow camera (OBS, Zoom, Chrome, ffmpeg): registered\n";
     } else {
-        wchar_t detail[200];
-        swprintf_s(detail, L"- Media Foundation camera: FAILED (0x%08lx)\n  Details: %%ProgramData%%\\LanCamera\\setup.log\n\n",
-                   (unsigned long)g_mfInstallResult);
+        wchar_t detail[160];
+        swprintf_s(detail, L"- DirectShow camera: FAILED to register (regsvr32 exit code %d)\n", g_dsRegisterResult);
         summary += detail;
-        summary += L"The DirectShow camera still works. The Windows Camera app will not list the camera.";
-    }
-    SetupLog(L"install finished: MF result 0x%08lx", (unsigned long)g_mfInstallResult);
-    if (!silent) {
-        MessageBoxW(NULL, summary.c_str(), L"LAN Camera Driver Setup", MB_OK | (SUCCEEDED(g_mfInstallResult) ? MB_ICONINFORMATION : MB_ICONWARNING));
     }
 
-    return 0;
+    if (mfOk && g_mfListed) {
+        summary += L"- Windows camera (Camera app, Teams, Zoom, Chrome, Unity): registered and listed by Windows\n";
+    } else if (mfOk) {
+        summary += L"- Windows camera: registered, but Windows does not list it yet. Restart the PC, or see mfsource.log\n";
+    } else if (g_mfInstallResult == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) {
+        summary += L"- Windows camera: NOT available. It needs Windows 11 (build 22000 or newer)\n";
+    } else if (!g_mfDllFound) {
+        summary += L"- Windows camera: NOT installed. LanCamMfSource.dll was not next to this installer\n";
+    } else {
+        wchar_t detail[200];
+        swprintf_s(detail, L"- Windows camera: FAILED (0x%08lx)\n", (unsigned long)g_mfInstallResult);
+        summary += detail;
+    }
+
+    const bool allGood = dsOk && mfOk && g_mfListed;
+    if (allGood) {
+        summary = L"LAN Phone Camera installed.\n\n" + summary + L"\nReopen any camera app, then click 'Set as Webcam' in the web viewer.";
+    } else {
+        summary = L"LAN Phone Camera installation finished with problems.\n\n" + summary +
+                  L"\nDetails are in %ProgramData%\\LanCamera\\setup.log";
+    }
+
+    SetupLog(L"install finished: directshow=%d mf=0x%08lx listed=%d", dsOk ? 1 : 0, (unsigned long)g_mfInstallResult, g_mfListed ? 1 : 0);
+    if (!silent) {
+        MessageBoxW(NULL, summary.c_str(), L"LAN Camera Driver Setup", MB_OK | (allGood ? MB_ICONINFORMATION : MB_ICONWARNING));
+    }
+
+    return allGood ? 0 : 1;
 }
