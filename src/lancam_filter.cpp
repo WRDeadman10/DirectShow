@@ -490,6 +490,31 @@ static void BlitTopDownToBottomUp(const BYTE* src, int srcW, int srcH, size_t sr
     }
 }
 
+static void DrawStandbySlate(BYTE* dst, int w, int h, size_t stride) {
+    if (!dst || w <= 0 || h <= 0) return;
+    const BYTE colors[8][3] = {
+        { 220, 220, 220 }, // Gray/White (BGR)
+        { 0, 220, 220 },   // Yellow
+        { 220, 220, 0 },   // Cyan
+        { 0, 220, 0 },     // Green
+        { 220, 0, 220 },   // Magenta
+        { 0, 0, 220 },     // Red
+        { 220, 0, 0 },     // Blue
+        { 24, 24, 24 }     // Dark Slate
+    };
+    int barW = max(1, w / 8);
+    for (int y = 0; y < h; ++y) {
+        BYTE* row = dst + (size_t)y * stride;
+        bool isBottomBand = (y < (h / 4));
+        for (int x = 0; x < w; ++x) {
+            int colorIdx = isBottomBand ? 7 : min(7, x / barW);
+            row[x * 3 + 0] = colors[colorIdx][0];
+            row[x * 3 + 1] = colors[colorIdx][1];
+            row[x * 3 + 2] = colors[colorIdx][2];
+        }
+    }
+}
+
 void LanCamPin::StreamLoop() {
     REFERENCE_TIME rtStart = 0;
     const REFERENCE_TIME rtFrameDuration = 10000000 / 30; // 30 FPS
@@ -536,9 +561,9 @@ void LanCamPin::StreamLoop() {
                 BlitTopDownToBottomUp(rgbBuffer.data(), frameW, frameH, srcStride, pBuffer, outW, outH, outStride);
                 pSample->SetActualDataLength((long)outBytes);
             } else {
-                // Blank dark test pattern while waiting for WebRTC stream
-                ZeroMemory(pBuffer, cbBuffer);
-                pSample->SetActualDataLength(cbBuffer);
+                // Render Standby Color Bars test pattern while waiting for stream
+                DrawStandbySlate(pBuffer, outW, outH, outStride);
+                pSample->SetActualDataLength((long)outBytes);
             }
 
             REFERENCE_TIME rtEnd = rtStart + rtFrameDuration;
